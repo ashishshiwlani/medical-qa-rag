@@ -1,6 +1,26 @@
 """
 LLM text generation for RAG answers.
 
+Streaming:
+  Both generators now expose generate_stream(query, context) → Iterator[str].
+
+  DemoGenerator (FLAN-T5):  Uses HuggingFace TextIteratorStreamer.
+    Inference runs in a background thread; the main thread yields decoded
+    tokens as they arrive.  This gives real word-by-word streaming even on CPU.
+
+  LLMGenerator (Mistral-7B):  Same pattern — TextIteratorStreamer wired to
+    the AutoModelForCausalLM.generate() call in a daemon thread.
+
+  Streamlit integration (in app/streamlit_app.py):
+    with st.chat_message("assistant"):
+        response_placeholder = st.empty()
+        full_text = ""
+        for token in pipeline.generate_stream(query, context):
+            full_text += token
+            response_placeholder.markdown(full_text + "▌")
+        response_placeholder.markdown(full_text)
+
+
 Handles:
   - System prompt design for medical Q&A (grounding, citation, safety)
   - Loading and configuring LLM models
@@ -17,8 +37,9 @@ Key concepts:
 """
 
 import os
+import threading
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Iterator
 
 # torch and transformers are only needed inside _load_model().
 # Keeping them out of the module-level scope means importing SYSTEM_PROMPT
@@ -243,6 +264,60 @@ class LLMGenerator:
         except Exception as e:
             raise RuntimeError(f"Generation failed: {e}")
 
+    def generate_stream(self, query: str, context: str) -> Iterator[str]:
+        """
+        Stream answer tokens one by one using TextIteratorStreamer.
+
+        Runs model.generate() in a background daemon thread and yields decoded
+        tokens from the main thread as they become available.
+
+        Args:
+            query:   User question.
+            context: Retrieved RAG context string.
+
+        Yields:
+            Decoded token strings (may include whitespace / punctuation).
+
+        Example:
+            >>> for token in generator.generate_stream("What is diabetes?", ctx):
+            ...     print(token, end="", flush=True)
+        """
+        try:
+            import torch
+            from transformers import TextIteratorStreamer
+        except ImportError:
+            # Fall back to yielding the full answer as one chunk
+            result = self.generate(query, context)
+            yield result.answer
+            return
+
+        prompt = self._build_prompt(query, context)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
+
+        gen_kwargs = {
+            **inputs,
+            "max_new_tokens":   self.max_new_tokens,
+            "do_sample":        True,
+            "temperature":      0.3,
+            "top_p":            0.9,
+            "streamer":         streamer,
+        }
+
+        # Run generation in a daemon thread so we can yield from the main thread
+        thread = threading.Thread(target=self.model.generate, kwargs=gen_kwargs, daemon=True)
+        thread.start()
+
+        for token_text in streamer:
+            yield token_text
+
+        thread.join()
+
 
 class DemoGenerator:
     """
@@ -343,3 +418,55 @@ class DemoGenerator:
                 model_name=self.model_name,
                 prompt_tokens=prompt_tokens
             )
+
+    def generate_stream(self, query: str, context: str) -> Iterator[str]:
+        """
+        Stream FLAN-T5 answer tokens using TextIteratorStreamer.
+
+        Uses a background thread exactly like LLMGenerator.generate_stream().
+        Falls back to yielding the full answer at once if streaming is unavailable.
+
+        Args:
+            query:   User question.
+            context: Retrieved RAG context.
+
+        Yields:
+            Decoded token strings.
+        """
+        try:
+            import torch
+            from transformers import TextIteratorStreamer
+        except ImportError:
+            result = self.generate(query, context)
+            yield result.answer
+            return
+
+        prompt = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question: {query}\n"
+            f"Answer:"
+        )
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+
+        streamer = TextIteratorStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+        )
+
+        gen_kwargs = {
+            **inputs,
+            "max_new_tokens": self.max_new_tokens,
+            "do_sample":      True,
+            "temperature":    0.3,
+            "streamer":       streamer,
+        }
+
+        thread = threading.Thread(target=self.model.generate, kwargs=gen_kwargs, daemon=True)
+        thread.start()
+
+        for token_text in streamer:
+            yield token_text
+
+        thread.join()

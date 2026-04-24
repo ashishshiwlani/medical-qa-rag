@@ -260,21 +260,86 @@ class RAGPipeline:
 
         return response
 
-    def ask_stream(self, query: str) -> Iterator[str]:
+    def retrieve(self, query: str):
         """
-        Generate answer as token stream (for streaming UI).
+        Run the retrieval step only and return (sources, context_string).
 
-        Not fully implemented in this version (requires streaming LLM).
-        Returns complete answer as single token for compatibility.
+        Useful when you want sources before starting generation
+        (e.g. to display them while streaming the answer).
 
         Args:
-            query: Medical question
+            query: Medical question.
+
+        Returns:
+            Tuple of (retrieved_chunks: List[RetrievedChunk], context: str).
+            retrieved_chunks is empty if no relevant documents are found.
+        """
+        self._initialize()
+        retrieved = self.retriever.retrieve_with_mmr(query, lambda_mult=0.5)
+        context   = format_context(retrieved) if retrieved else ""
+        return retrieved, context
+
+    def ask_stream(self, query: str) -> Iterator[str]:
+        """
+        Stream the RAG answer token-by-token using TextIteratorStreamer.
+
+        Separates the pipeline into two phases:
+          1. Retrieval (blocking) — fetches relevant documents from FAISS.
+          2. Generation (streaming) — yields decoded tokens as they arrive
+             from the background generation thread.
+
+        The caller is responsible for separately displaying sources.
+        Use :meth:`retrieve` first if you need sources before tokens start:
+
+        Example (Streamlit)::
+
+            sources, context = pipeline.retrieve(query)
+            # show sources ...
+            placeholder = st.empty()
+            full = ""
+            for token in pipeline._stream_from_context(query, context):
+                full += token
+                placeholder.markdown(full + "▌")
+            placeholder.markdown(full)
+
+        For simple use, just call ask_stream() directly:
+
+            for token in pipeline.ask_stream("What is pneumonia?"):
+                print(token, end="", flush=True)
+
+        Args:
+            query: Medical question.
 
         Yields:
-            Answer tokens (currently: single yield of complete answer)
+            Decoded token strings from the LLM.
         """
-        response = self.ask(query)
-        yield response.answer
+        self._initialize()
+
+        retrieved = self.retriever.retrieve_with_mmr(query, lambda_mult=0.5)
+
+        if not retrieved:
+            yield "I don't have information about that in the available medical literature."
+            return
+
+        context = format_context(retrieved)
+        yield from self.generator.generate_stream(query, context)
+
+    def _stream_from_context(self, query: str, context: str) -> Iterator[str]:
+        """
+        Stream tokens given pre-computed context (used after retrieve()).
+
+        Args:
+            query:   Medical question.
+            context: Already-formatted context string from retrieve().
+
+        Yields:
+            Decoded token strings.
+        """
+        self._initialize()
+        if not context:
+            yield "I don't have information about that in the available medical literature."
+            return
+        yield from self.generator.generate_stream(query, context)
 
 
 def build_index_from_corpus(corpus_path: str, index_dir: str) -> None:

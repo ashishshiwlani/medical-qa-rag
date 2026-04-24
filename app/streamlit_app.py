@@ -252,25 +252,42 @@ if user_input:
         with st.chat_message("user"):
             st.markdown(user_input)
 
-    # Generate response
+    # Generate response with token-by-token streaming
     with chat_container:
         with st.chat_message("assistant"):
-            with st.spinner("🔍 Retrieving relevant medical information..."):
-                try:
-                    # Call RAG pipeline
-                    response = pipeline.ask(user_input)
+            try:
+                # ── Phase 1: Retrieval (blocking, ~100ms) ──────────────────────
+                with st.spinner("🔍 Retrieving relevant medical information..."):
+                    sources, context = pipeline.retrieve(user_input)
 
-                    # Display answer
-                    st.markdown(response.answer)
+                # ── Phase 2: Streaming generation ─────────────────────────────
+                # st.write_stream() consumes the iterator and renders tokens
+                # as they arrive, giving a ChatGPT-like typing effect.
+                # We wrap the generator so we can capture the full text for
+                # storing in session_state afterwards.
 
-                    # Display source metadata if enabled
-                    if show_sources and response.sources:
-                        with st.expander(
-                            f"📚 Sources ({len(response.sources)} documents)",
-                            expanded=False
-                        ):
-                            for i, chunk in enumerate(response.sources, 1):
-                                st.markdown(f"""
+                full_answer_parts: list = []
+
+                def _token_iter():
+                    for token in pipeline._stream_from_context(user_input, context):
+                        full_answer_parts.append(token)
+                        yield token
+
+                if context:
+                    full_answer = st.write_stream(_token_iter())
+                else:
+                    fallback = "I don't have information about that in the available medical literature."
+                    st.markdown(fallback)
+                    full_answer = fallback
+
+                # ── Sources panel ──────────────────────────────────────────────
+                if show_sources and sources:
+                    with st.expander(
+                        f"📚 Sources ({len(sources)} documents)",
+                        expanded=False,
+                    ):
+                        for i, chunk in enumerate(sources, 1):
+                            st.markdown(f"""
 <div class="source-citation">
     <strong>[{i}]</strong>
     <span class="score-badge">Similarity: {chunk.score:.2f}</span><br/>
@@ -281,26 +298,23 @@ if user_input:
 </div>
 """, unsafe_allow_html=True)
 
-                    # Display timing info
-                    st.caption(
-                        f"Generated in {response.generation_time:.2f}s "
-                        f"using {response.model_name}"
-                    )
+                st.caption(f"Using {pipeline.generator.model_name if pipeline.generator else 'model'}")
 
-                except Exception as e:
-                    st.error(f"Error generating response: {str(e)}")
-                    st.info("Please check the pipeline logs or try again with a different query.")
+            except Exception as e:
+                full_answer = "Error generating response"
+                sources = []
+                st.error(f"Error generating response: {str(e)}")
+                st.info("Please check the pipeline logs or try again with a different query.")
 
     # Add assistant message to history
-    if user_input:
-        assistant_message = {
-            "role": "assistant",
-            "content": response.answer if 'response' in locals() else "Error generating response",
-        }
-        if 'response' in locals() and response.sources:
-            assistant_message["sources"] = response.sources
+    assistant_message = {
+        "role": "assistant",
+        "content": full_answer if 'full_answer' in locals() else "Error generating response",
+    }
+    if 'sources' in locals() and sources:
+        assistant_message["sources"] = sources
 
-        st.session_state.messages.append(assistant_message)
+    st.session_state.messages.append(assistant_message)
 
 
 # ============================================================================
